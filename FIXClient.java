@@ -5,212 +5,287 @@ import java.util.*;
 import java.util.concurrent.*;
 
 public class FIXClient {
+    private static final String SERVER_HOST = "127.0.0.1";
+    private static final int SERVER_PORT = 5000;
+    private static final String SENDER_COMP_ID = "TESTINJAVA";
+    private static final String TARGET_COMP_ID = "MINIFIX";
+    private static final int HEARTBEAT_INTERVAL = 30; //seconds
 
-	private static final String SERVER_HOST = "127.0.0.1";
-	private static final int SERVER_PORT = 5000;
-	private static final String SENDER_COMP_ID = "TESTINJAVA";
-	private static final String TARGET_COMP_ID = "MINIFIX";
-	private static final int HEARTBEAT_INTERVAL = 30; //seconds
+    private Socket socket;
+    private BufferedReader input;
+    private PrintWriter output;
+    private volatile boolean isRunning;
+    private int messageSequenceNumber;
+    private ScheduledExecutorService scheduler;
 
-	private Socket socket;
-	private BufferedReader input;
-	private PrintWriter output;
-	private volatile boolean isRunning;
-	private int messageSequenceNumber;
-	private ScheduledExecutorService scheduler;
+    public static void main(String[] args) {
+        FIXClient client = new FIXClient();
+        try {
+            client.start();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
 
-	public static void main(String[] args) {
-		FIXClient client = new FIXClient();
-		try {
-			client.start();
-		} catch (IOException e) {
-			e.printStackTrace();
-		}
-	}
+    private void start() throws IOException {
+        connect();
+        isRunning = true;
+        messageSequenceNumber = 1;
 
-	private void start() throws IOException {
-		connect();
-		isRunning = true;
-		messageSequenceNumber = 1;
+        // Initialize scheduler with two tasks
+        scheduler = Executors.newScheduledThreadPool(2);
+        
+        // Schedule heartbeat sending
+        scheduler.scheduleAtFixedRate(() -> {
+            if (isRunning) {
+                sendHeartbeat(null);  // Regular heartbeat without TestReqID
+            }
+        }, HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL, TimeUnit.SECONDS);
+        
+        // Schedule test request sending
+        scheduler.scheduleAtFixedRate(this::sendTestRequest, 
+            HEARTBEAT_INTERVAL/2, HEARTBEAT_INTERVAL/2, TimeUnit.SECONDS);
 
-		scheduler = Executors.newScheduledThreadPool(1);
-		scheduler.scheduleAtFixedRate(this::sendTestRequest, HEARTBEAT_INTERVAL/2, HEARTBEAT_INTERVAL/2, TimeUnit.SECONDS);
+        sendLogonMessage();
+        listenForMessages();
+    }
 
-		sendLogonMessage();
-		listenForMessages();
-	}
+    private void connect() throws IOException {
+        socket = new Socket(SERVER_HOST, SERVER_PORT);
+        socket.setKeepAlive(true);
+        socket.setTcpNoDelay(true);
+        System.out.println("Connected to FIX server at " + SERVER_HOST + ":" + SERVER_PORT);
+    }
 
-	private void connect() throws IOException {
-		socket = new Socket(SERVER_HOST, SERVER_PORT);
-		socket.setKeepAlive(true);
-		socket.setSoTimeout(HEARTBEAT_INTERVAL * 2 * 1000);
-		input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-		output = new PrintWriter(new OutputStreamWriter(socket.getOutputStream()), true);
-		System.out.println("Connected to FIX server at " + SERVER_HOST + ":" + SERVER_PORT);
-	}
+    private void sendLogonMessage() {
+        String logonMessage = createLogonMessage();
+        System.out.println("Sending logon message: " + logonMessage);
+        sendMessage(logonMessage);
+    }
 
-	private void sendLogonMessage() {
-		String logonMessage = createLogonMessage();
-		System.out.println("Sending logon message: " + logonMessage);
-		//output.println(logonMessage);
-		sendMessage(logonMessage);
-	}
+    private synchronized void sendMessage(String message) {
+        // Convert to ASCII and add SOH
+        byte[] messageBytes = message.replaceAll("\\|", "\u0001").getBytes(StandardCharsets.US_ASCII);
+        try {
+            socket.getOutputStream().write(messageBytes);
+            socket.getOutputStream().write('\u0001');
+            socket.getOutputStream().flush();
+            messageSequenceNumber++;
+        } catch (IOException e) {
+            System.err.println("Error sending message: " + e.getMessage());
+            cleanup();
+        }
+    }
 
-	private synchronized void sendMessage(String message) {
-		output.println(message);
-		messageSequenceNumber++;
-	}
+    private String createLogonMessage() {
+        // First create the message body (everything between tag 35 and checksum)
+        StringBuilder body = new StringBuilder()
+            .append("35=A|")
+            .append("49=").append(SENDER_COMP_ID).append("|")
+            .append("56=").append(TARGET_COMP_ID).append("|")
+            .append("34=").append(messageSequenceNumber).append("|")
+            .append("52=").append(getCurrentTimestamp()).append("|")
+            .append("108=").append(HEARTBEAT_INTERVAL);
 
-	private String createLogonMessage() {
-		StringBuilder message = new StringBuilder();
-		String header = "8=FIX.4.2|9=|35=A|49=" + SENDER_COMP_ID + "|56=" + TARGET_COMP_ID;
+        // Calculate the body length
+        int bodyLength = body.toString().replaceAll("\\|", "\u0001").getBytes(StandardCharsets.UTF_8).length;
 
-		message.append("8=FIX.4.2|");
-		message.append("9=").append(generateMessageLength(header)).append("|");
-		message.append("35=A|");
-		message.append("49=").append(SENDER_COMP_ID).append("|");
-		message.append("56=").append(TARGET_COMP_ID).append("|");
-		message.append("34=").append(messageSequenceNumber).append("|");
-		message.append("52=").append(getCurrentTimestamp()).append("|");
-		message.append("108=").append(HEARTBEAT_INTERVAL).append("|");
-		message.append("10=").append(calculateChecksum(message.toString())).append("|");
-			
-		return message.toString().replaceAll("\\|$", "");
-	}
+        // Create the complete message
+        StringBuilder message = new StringBuilder()
+            .append("8=FIX.4.2|")
+            .append("9=").append(bodyLength).append("|")
+            .append(body).append("|");
 
-	private void sendTestRequest() {
-		if (!isRunning) return;
+        // Add the checksum
+        String checksumStr = calculateChecksum(message.toString().replaceAll("\\|", "\u0001"));
+        message.append("10=").append(checksumStr);
 
-		StringBuilder message = new StringBuilder();
-		String testReqId = "TEST" + System.currentTimeMillis();
-		String header = "8=FIX.4.2|9=|35=1|49=" + SENDER_COMP_ID + "|56=" + TARGET_COMP_ID;
-		
-		message.append("8=FIX.4.2|");
-		message.append("9=").append(generateMessageLength(header)).append("|");
-		message.append("35=1|");  // Test Request message type
-		message.append("49=").append(SENDER_COMP_ID).append("|");
-		message.append("56=").append(TARGET_COMP_ID).append("|");
-		message.append("34=").append(messageSequenceNumber).append("|");
-		message.append("52=").append(getCurrentTimestamp()).append("|");
-		message.append("112=").append(testReqId).append("|");  // TestReqID
-		message.append("10=").append(calculateChecksum(message.toString())).append("|");
-		
-		System.out.println("Sending test request: " + message.toString().replaceAll("\\|$", ""));
-		sendMessage(message.toString().replaceAll("\\|$", ""));
-	}
+        return message.toString();
+    }
 
-	private void sendHeartbeat(String testReqId) {
-		if (!isRunning) return;
+    private void sendTestRequest() {
+        if (!isRunning) return;
 
-		StringBuilder message = new StringBuilder();
-		String header = "8=FIX.4.2|9=|35=0|49=" + SENDER_COMP_ID + "|56=" + TARGET_COMP_ID;
+        String testReqId = "TEST" + System.currentTimeMillis();
+        
+        // Create the message body
+        StringBuilder body = new StringBuilder()
+            .append("35=1|")
+            .append("49=").append(SENDER_COMP_ID).append("|")
+            .append("56=").append(TARGET_COMP_ID).append("|")
+            .append("34=").append(messageSequenceNumber).append("|")
+            .append("52=").append(getCurrentTimestamp()).append("|")
+            .append("112=").append(testReqId);
 
-		message.append("8=FIX.4.2|");
-		message.append("9=").append(generateMessageLength(header)).append("|");
-		message.append("35=0|");
-		message.append("49=").append(SENDER_COMP_ID).append("|");
-		message.append("56=").append(TARGET_COMP_ID).append("|");
-		message.append("34=").append(messageSequenceNumber).append("|");
-		message.append("52=").append(getCurrentTimestamp()).append("|");
-		if (testReqId != null) {
-			message.append("112=").append(testReqId).append("|");
-		}
-		message.append("10=").append(calculateChecksum(message.toString())).append("|");
+        // Calculate the body length
+        int bodyLength = body.toString().replaceAll("\\|", "\u0001").getBytes(StandardCharsets.UTF_8).length;
 
-		System.out.println("Sending heartbeat: " + message.toString().replaceAll("\\|$", ""));
-		sendMessage(message.toString().replaceAll("\\|$", ""));
-	}
+        // Create the complete message
+        StringBuilder message = new StringBuilder()
+            .append("8=FIX.4.2|")
+            .append("9=").append(bodyLength).append("|")
+            .append(body).append("|");
 
+        // Add the checksum
+        String checksumStr = calculateChecksum(message.toString().replaceAll("\\|", "\u0001"));
+        message.append("10=").append(checksumStr);
 
-	private void cleanup() {
-		try {
-			if (socket != null && !socket.isClosed()) {
-				socket.close();
-			}
-			if (input != null) {
-				input.close();
-			}
-			if (output != null) {
-				output.close();
-			}
-			if (scheduler != null) {
-				scheduler.shutdown();
-			}
-		} catch (IOException e) {
-			System.err.println("Error during cleanup: " + e.getMessage());
-		}
-	}
+        String finalMessage = message.toString();
+        System.out.println("Sending test request: " + finalMessage);
+        sendMessage(finalMessage);
+    }
 
-	private void listenForMessages() throws IOException {
-		String incomingMessage;
-		while (isRunning && (incomingMessage = input.readLine()) != null) {
-			//System.out.println("Received message: " + incomingMessage);
-			processMessage(incomingMessage);
-		}
-	}
+    private void sendHeartbeat(String testReqId) {
+        if (!isRunning) return;
 
-	private void processMessage(String message) {
-		System.out.println("Received message: " + message);
+        // Create the message body
+        StringBuilder body = new StringBuilder()
+            .append("35=0|")
+            .append("49=").append(SENDER_COMP_ID).append("|")
+            .append("56=").append(TARGET_COMP_ID).append("|")
+            .append("34=").append(messageSequenceNumber).append("|")
+            .append("52=").append(getCurrentTimestamp());
 
-		Map<String, String> fields = parseMessage(message);
-		String messageType = fields.get("35");
+        if (testReqId != null) {
+            body.append("|112=").append(testReqId);
+        }
 
+        // Calculate the body length
+        int bodyLength = body.toString().replaceAll("\\|", "\u0001").getBytes(StandardCharsets.UTF_8).length;
 
-		if (messageType != null) {
-			switch(messageType) {
-				case "0":
-					break;
-				case "1":
-					String testReqId = fields.get("112");
-					if (testReqId != null) {
-						sendHeartbeat(testReqId);
-					}
-					break;
-				case "5": 
-					handleLogout();
-					break;
-			}
-		}
-	}
+        // Create the complete message
+        StringBuilder message = new StringBuilder()
+            .append("8=FIX.4.2|")
+            .append("9=").append(bodyLength).append("|")
+            .append(body).append("|");
 
-	private Map<String, String> parseMessage(String message) {
-		Map<String, String> fields = new HashMap<>();
-		String[] pairs = message.split("\\|");
-		for (String pair : pairs) {
-			String[] keyValue = pair.split("=");
-			if (keyValue.length == 2) {
-				fields.put(keyValue[0], keyValue[1]);
-			}
-		}
-		return fields;
-	}
+        // Add the checksum
+        String checksumStr = calculateChecksum(message.toString().replaceAll("\\|", "\u0001"));
+        message.append("10=").append(checksumStr);
 
-	private void handleLogout() {
-		isRunning = false;
-		cleanup();
-	}
+        String finalMessage = message.toString();
+        System.out.println("Sending heartbeat: " + finalMessage);
+        sendMessage(finalMessage);
+    }
 
-	private String generateMessageLength(String message) {
-		return String.valueOf(message.getBytes(StandardCharsets.UTF_8).length);
-	}
+    private void cleanup() {
+        try {
+            if (socket != null && !socket.isClosed()) {
+                socket.close();
+            }
+            if (input != null) {
+                input.close();
+            }
+            if (output != null) {
+                output.close();
+            }
+            if (scheduler != null) {
+                scheduler.shutdown();
+            }
+        } catch (IOException e) {
+            System.err.println("Error during cleanup: " + e.getMessage());
+        }
+    }
 
-	private String getCurrentTimestamp() {
-		Calendar calendar = Calendar.getInstance();
-		int year = calendar.get(Calendar.YEAR);
-		int month = calendar.get(Calendar.MONTH) + 1;
-		int day = calendar.get(Calendar.DAY_OF_MONTH);
-		int hour = calendar.get(Calendar.HOUR_OF_DAY);
-		int minute = calendar.get(Calendar.MINUTE);
-		int second = calendar.get(Calendar.SECOND);
+    private void listenForMessages() throws IOException {
+        BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+        StringBuilder currentMessage = new StringBuilder();
+        String line;
+        
+        while (isRunning && (line = reader.readLine()) != null) {
+            if (line.startsWith("8=FIX")) {
+                // Start of new message
+                if (currentMessage.length() > 0) {
+                    // Process previous message if exists
+                    String completeMessage = currentMessage.toString();
+                    System.out.println("<<< " + completeMessage);  // Indicate incoming message
+                    processMessage(completeMessage);
+                }
+                currentMessage = new StringBuilder();
+                currentMessage.append(line);
+            } else if (line.startsWith("10=")) {
+                // End of message (checksum)
+                currentMessage.append("|").append(line);
+                String completeMessage = currentMessage.toString();
+                System.out.println("<<< " + completeMessage);  // Indicate incoming message
+                processMessage(completeMessage);
+                currentMessage = new StringBuilder();
+            } else if (currentMessage.length() > 0) {
+                // Middle of message
+                currentMessage.append("|").append(line);
+            }
+        }
+    }
 
-		return String.format("%04d%02d%02d-%02d:%02d:%02d", year, month, day, hour, minute, second);
-	}
+    private void processMessage(String message) {
+        Map<String, String> fields = parseMessage(message);
+        String messageType = fields.get("35");
 
-	private String calculateChecksum(String message) {
-		int checksum = 0;
-		for (int i = 0; i < message.length(); i++) {
-			checksum += message.charAt(i);
-		}
-		return String.format("%03d", checksum % 256);
-	}
+        if (messageType != null) {
+            switch(messageType) {
+                case "0":  // Heartbeat
+                    System.out.println("Received heartbeat from " + fields.get("49"));
+                    break;
+                case "1":  // Test Request
+                    System.out.println("Received test request from " + fields.get("49"));
+                    String testReqId = fields.get("112");
+                    if (testReqId != null) {
+                        sendHeartbeat(testReqId);
+                    }
+                    break;
+                case "2":  // Resend Request
+                    System.out.println("Received resend request");
+                    break;
+                case "3":  // Reject
+                    System.out.println("Received reject: " + fields.get("58"));
+                    break;
+                case "5":  // Logout
+                    System.out.println("Received logout");
+                    handleLogout();
+                    break;
+                case "A":  // Logon
+                    System.out.println("Received logon from " + fields.get("49"));
+                    // Start sending heartbeats after logon
+                    break;
+            }
+        }
+    }
+
+    private Map<String, String> parseMessage(String message) {
+        Map<String, String> fields = new HashMap<>();
+        String[] pairs = message.split("\\|");
+        for (String pair : pairs) {
+            String[] keyValue = pair.split("=");
+            if (keyValue.length == 2) {
+                fields.put(keyValue[0], keyValue[1]);
+            }
+        }
+        return fields;
+    }
+
+    private void handleLogout() {
+        isRunning = false;
+        cleanup();
+    }
+
+    private String getCurrentTimestamp() {
+        Calendar calendar = Calendar.getInstance();
+        int year = calendar.get(Calendar.YEAR);
+        int month = calendar.get(Calendar.MONTH) + 1;
+        int day = calendar.get(Calendar.DAY_OF_MONTH);
+        int hour = calendar.get(Calendar.HOUR_OF_DAY);
+        int minute = calendar.get(Calendar.MINUTE);
+        int second = calendar.get(Calendar.SECOND);
+
+        return String.format("%04d%02d%02d-%02d:%02d:%02d", 
+            year, month, day, hour, minute, second);
+    }
+
+    private String calculateChecksum(String message) {
+        int sum = 0;
+        for (byte b : message.getBytes(StandardCharsets.US_ASCII)) {
+            sum += b & 0xFF;
+        }
+        return String.format("%03d", sum % 256);
+    }
 }
