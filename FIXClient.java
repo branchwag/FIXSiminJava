@@ -188,31 +188,26 @@ public class FIXClient {
     }
 
     private void listenForMessages() throws IOException {
-        BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-        StringBuilder currentMessage = new StringBuilder();
-        String line;
-        
-        while (isRunning && (line = reader.readLine()) != null) {
-            if (line.startsWith("8=FIX")) {
-                // Start of new message
-                if (currentMessage.length() > 0) {
-                    // Process previous message if exists
-                    String completeMessage = currentMessage.toString();
-                    System.out.println("<<< " + completeMessage);  // Indicate incoming message
-                    processMessage(completeMessage);
+        byte[] buffer = new byte[4096];
+        int bytesRead;
+        StringBuilder message = new StringBuilder();
+
+        while (isRunning && (bytesRead = socket.getInputStream().read(buffer)) != -1) {
+            String chunk = new String(buffer, 0, bytesRead, StandardCharsets.US_ASCII);
+            String[] messages = chunk.split("\u0001");
+
+            for (String msg : messages) {
+                if (!msg.isEmpty()) {
+                    message.append(msg);
+                    if (msg.contains("10=")) {
+                        String completeMsg = message.toString().replace("\u0001", "|");
+                        System.out.println("<<< " + completeMsg);
+                        processMessage(completeMsg);
+                        message = new StringBuilder();
+                    } else {
+                        message.append("|");
+                    }
                 }
-                currentMessage = new StringBuilder();
-                currentMessage.append(line);
-            } else if (line.startsWith("10=")) {
-                // End of message (checksum)
-                currentMessage.append("|").append(line);
-                String completeMessage = currentMessage.toString();
-                System.out.println("<<< " + completeMessage);  // Indicate incoming message
-                processMessage(completeMessage);
-                currentMessage = new StringBuilder();
-            } else if (currentMessage.length() > 0) {
-                // Middle of message
-                currentMessage.append("|").append(line);
             }
         }
     }
@@ -224,27 +219,27 @@ public class FIXClient {
         if (messageType != null) {
             switch(messageType) {
                 case "0":  // Heartbeat
-                    System.out.println("Received heartbeat from " + fields.get("49"));
+                    //System.out.println("Received heartbeat from " + fields.get("49"));
                     break;
                 case "1":  // Test Request
-                    System.out.println("Received test request from " + fields.get("49"));
+                    //System.out.println("Received test request from " + fields.get("49"));
                     String testReqId = fields.get("112");
                     if (testReqId != null) {
                         sendHeartbeat(testReqId);
                     }
                     break;
                 case "2":  // Resend Request
-                    System.out.println("Received resend request");
+                    //System.out.println("Received resend request");
                     break;
                 case "3":  // Reject
-                    System.out.println("Received reject: " + fields.get("58"));
+                    //System.out.println("Received reject: " + fields.get("58"));
                     break;
                 case "5":  // Logout
-                    System.out.println("Received logout");
+                    //System.out.println("Received logout");
                     handleLogout();
                     break;
                 case "A":  // Logon
-                    System.out.println("Received logon from " + fields.get("49"));
+                    //System.out.println("Received logon from " + fields.get("49"));
                     // Start sending heartbeats after logon
                     break;
             }
